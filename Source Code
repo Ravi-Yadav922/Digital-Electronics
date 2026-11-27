@@ -1,0 +1,123 @@
+#define BLYNK_PRINT Serial
+#define BLYNK_TEMPLATE_ID "YOUR_BLYNK_TEMPLATE_ID"
+#define BLYNK_TEMPLATE_NAME "SmartEnvironmentFanTrigger"
+#define BLYNK_AUTH_TOKEN "YOUR_BLYNK_AUTH_TOKEN"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <DHT.h>
+
+// Replace with your Wi-Fi network credentials before testing
+const char* WIFI_SSID = "YOUR_WIFI_SSID";
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+
+// Pin definitions
+#define DHT_PIN 4
+#define DHT_TYPE DHT22
+#define RELAY_PIN 23
+#define BUTTON_PIN 18
+#define RED_LED_PIN 19
+#define GREEN_LED_PIN 21
+
+// Most 5V relay modules are active-LOW; set to false if active-HIGH
+const bool RELAY_ACTIVE_LOW = true;
+
+// Winter-friendly auto-calibrated temperature trigger + fixed humidity trigger
+const float TEMP_OFFSET_C = 2.0;
+const float HUMIDITY_THRESHOLD = 75.0;
+const unsigned long POLL_INTERVAL_MS = 2000;
+
+DHT dht(DHT_PIN, DHT_TYPE);
+BlynkTimer timer;
+
+float baselineTemp = 20.0;
+float tempThreshold = 22.0;
+bool isCalibrated = false;
+int remoteSwitchState = 0;
+
+void applyOutputs(bool fanOn) {
+  if (RELAY_ACTIVE_LOW) {
+    digitalWrite(RELAY_PIN, fanOn ? LOW : HIGH);
+  } else {
+    digitalWrite(RELAY_PIN, fanOn ? HIGH : LOW);
+  }
+
+  digitalWrite(RED_LED_PIN, fanOn ? HIGH : LOW);
+  digitalWrite(GREEN_LED_PIN, fanOn ? LOW : HIGH);
+}
+
+// Handles remote switch updates from Blynk virtual pin V2
+BLYNK_WRITE(V2) {
+  remoteSwitchState = param.asInt();
+}
+
+void evaluateEnvironmentAndControl() {
+  float humidity = dht.readHumidity();
+  float temperature = dht.readTemperature();
+
+  if (isnan(humidity) || isnan(temperature)) {
+    Serial.println("Warning: Failed to read from DHT22 sensor.");
+    return;
+  }
+
+  // Set trigger temperature (+2.0 C above initial room reading) on first valid read
+  if (!isCalibrated) {
+    baselineTemp = temperature;
+    tempThreshold = baselineTemp + TEMP_OFFSET_C;
+    isCalibrated = true;
+
+    Serial.print("Baseline Temp: ");
+    Serial.print(baselineTemp, 1);
+    Serial.print(" C | Trigger Temp: ");
+    Serial.print(tempThreshold, 1);
+    Serial.println(" C");
+  }
+
+  // Digital logic inputs (1 = active, 0 = inactive)
+  int sensorTrigger = ((temperature > tempThreshold) || (humidity > HUMIDITY_THRESHOLD)) ? 1 : 0;
+  int manualOverride = (digitalRead(BUTTON_PIN) == LOW) ? 1 : 0;
+  int remoteOverride = (remoteSwitchState == 1) ? 1 : 0;
+
+  // Boolean OR logic: Y = S + M + R
+  bool fanOn = (sensorTrigger == 1) || (manualOverride == 1) || (remoteOverride == 1);
+  applyOutputs(fanOn);
+
+  // Send telemetry to Blynk Cloud (V0 = Temperature, V1 = Humidity)
+  Blynk.virtualWrite(V0, temperature);
+  Blynk.virtualWrite(V1, humidity);
+
+  Serial.print("Temp: ");
+  Serial.print(temperature, 1);
+  Serial.print(" C | Hum: ");
+  Serial.print(humidity, 1);
+  Serial.print("% | S=");
+  Serial.print(sensorTrigger);
+  Serial.print(" M=");
+  Serial.print(manualOverride);
+  Serial.print(" R=");
+  Serial.print(remoteOverride);
+  Serial.print(" -> FAN_ON=");
+  Serial.println(fanOn ? "1" : "0");
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(RED_LED_PIN, OUTPUT);
+  pinMode(GREEN_LED_PIN, OUTPUT);
+
+  // Start with fan OFF and Green LED ON
+  applyOutputs(false);
+
+  dht.begin();
+  Blynk.begin(BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASS);
+
+  timer.setInterval(POLL_INTERVAL_MS, evaluateEnvironmentAndControl);
+}
+
+void loop() {
+  Blynk.run();
+  timer.run();
+}
